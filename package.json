@@ -1,6 +1,6 @@
 {
   "name": "byteforge-loki-logging-ts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript library for pushing structured logs to Grafana Loki",
   "author": "Jason Byteforge (@jmazzahacks)",
   "license": "MIT",
@@ -24,6 +24,7 @@
     "dist"
   ],
   "scripts": {
+    "prepare": "tsup",
     "build": "tsup",
     "test": "vitest run",
     "test:watch": "vitest"
