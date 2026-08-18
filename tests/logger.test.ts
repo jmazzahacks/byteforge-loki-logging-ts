@@ -6,6 +6,7 @@ const mockAdd = vi.fn();
 const mockStart = vi.fn();
 const mockStop = vi.fn();
 const mockBatchFlush = vi.fn();
+const mockDrain = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("../src/batch.js", function () {
   return {
@@ -15,6 +16,7 @@ vi.mock("../src/batch.js", function () {
         start: mockStart,
         stop: mockStop,
         flush: mockBatchFlush,
+        drain: mockDrain,
       };
     }),
   };
@@ -136,15 +138,15 @@ describe("LokiLogger", function () {
       expect(mockBatchFlush).toHaveBeenCalledTimes(1);
     });
 
-    it("should flush and stop on close()", function () {
+    it("should stop the timer and drain the backlog on close()", async function () {
       const logger = new LokiLogger({
         transport: { url: "http://localhost:3100" },
         batch: { capacity: 10 },
       });
 
-      logger.close();
-      expect(mockBatchFlush).toHaveBeenCalledTimes(1);
+      await logger.close();
       expect(mockStop).toHaveBeenCalledTimes(1);
+      expect(mockDrain).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -37,16 +37,28 @@ Four layers, each usable standalone and all re-exported from `src/index.ts`:
   label object JSON-stringified with sorted keys), converts ms timestamps to the
   nanosecond *strings* Loki requires via `BigInt`, and renders the message as raw
   text or, with `asJson`, as `{message, ...extra}`.
-  Note the `sending` re-entrancy guard: `emitBatch()` returns `null` and **silently
-  drops the batch** if a send is already in flight. Preserve or deliberately revisit
-  this — it is why the emitter never queues.
+  The emitter is deliberately **stateless with respect to concurrency** — it holds
+  no in-flight flag and safely handles overlapping calls. It used to carry a
+  `sending` mutex that silently discarded overlapping batches (ticket `f26568f7`);
+  that guard protected nothing and only ever lost records. Don't reintroduce it —
+  backpressure belongs in `BatchManager`.
 
-- **`BatchManager`** (`src/batch.ts`) — owns its own `LokiEmitter`. Flushes on
-  capacity (in `add()`) and on a `setInterval` that is `unref()`'d so it never holds
-  the process open. `flush()` swaps the buffer out synchronously before the async
-  send, and swallows send failures to `console.error` — flushing is fire-and-forget.
+- **`BatchManager`** (`src/batch.ts`) — owns its own `LokiEmitter` and all the
+  delivery guarantees. Flushes on capacity (in `add()`) and on a `setInterval` that
+  is `unref()`'d so it never holds the process open. The invariant to preserve:
+  **records leave the buffer only when a push will actually carry them**, so at the
+  `maxConcurrentPushes` ceiling `flush()` is a no-op and they stay put. A settling
+  push drains whatever accumulated, except after a re-queue — draining there would
+  retry a failing Loki as fast as the network allows, so the interval timer paces
+  it instead. `flush()` chunks at `capacity` so a backlog is never posted as one
+  oversized request. `drain()` (awaited by `LokiLogger.close()`) is the only way to
+  know the backlog landed.
+  Because `LokiTransport.send()` **resolves** for every HTTP status, non-2xx
+  handling lives in the `.then()`, not the `.catch()` — a `.catch()`-only flush is
+  how 429s used to vanish. Every discard path must stay audible on stderr.
 
-- **`LokiLogger`** (`src/logger.ts`) — the public facade. It creates *either* a
+- **`LokiLogger`** (`src/logger.ts`) — the public facade. `close()` is async and
+  must be awaited to guarantee delivery. It creates *either* a
   `BatchManager` (when `config.batch` is present) *or* a bare `LokiEmitter`, never
   both. This is why the log methods have the union return type
   `Promise<TransportResult | null> | void`: direct mode returns the transport

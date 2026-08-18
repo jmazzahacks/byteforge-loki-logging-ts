@@ -3,7 +3,7 @@ import { BatchManager } from "../src/batch.js";
 import type { LogRecord } from "../src/types.js";
 
 // Mock the emitter
-const mockEmitBatch = vi.fn().mockResolvedValue({ ok: true, statusCode: 204, body: "" });
+const mockEmitBatch = vi.fn();
 
 vi.mock("../src/emitter.js", function () {
   return {
@@ -26,6 +26,7 @@ describe("BatchManager", function () {
 
   beforeEach(function () {
     vi.clearAllMocks();
+    mockEmitBatch.mockResolvedValue({ ok: true, statusCode: 204, body: "" });
     vi.useFakeTimers();
   });
 
@@ -130,6 +131,179 @@ describe("BatchManager", function () {
     batch.add(makeRecord());
 
     vi.advanceTimersByTime(1000);
+    expect(mockEmitBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps records buffered instead of dropping them when at the concurrency ceiling", function () {
+    // Regression for ticket f26568f7 defect 1: a flush overlapping an
+    // in-flight push used to detach the records and then discard them.
+    mockEmitBatch.mockReturnValue(new Promise(function neverSettles() {}));
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2, maxConcurrentPushes: 1 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+    expect(mockEmitBatch).toHaveBeenCalledTimes(1);
+    expect(batch.getInFlightCount()).toBe(1);
+
+    batch.add(makeRecord("msg3"));
+    batch.add(makeRecord("msg4"));
+
+    // Still one push out, and nothing was thrown away.
+    expect(mockEmitBatch).toHaveBeenCalledTimes(1);
+    expect(batch.getBufferSize()).toBe(2);
+  });
+
+  it("drains the backlog when an in-flight push settles", async function () {
+    let releasePush: () => void = function noop() {};
+    mockEmitBatch.mockReturnValueOnce(
+      new Promise(function capture(resolve) {
+        releasePush = function release() {
+          resolve({ ok: true, statusCode: 204, body: "" });
+        };
+      }),
+    );
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2, maxConcurrentPushes: 1 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+    batch.add(makeRecord("msg3"));
+    batch.add(makeRecord("msg4"));
+    expect(batch.getBufferSize()).toBe(2);
+
+    releasePush();
+    await vi.waitFor(function backlogDrained() {
+      expect(mockEmitBatch).toHaveBeenCalledTimes(2);
+      expect(batch.getBufferSize()).toBe(0);
+    });
+
+    expect(mockEmitBatch).toHaveBeenLastCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({ message: "msg3" }),
+        expect.objectContaining({ message: "msg4" }),
+      ]),
+    );
+  });
+
+  it("bounds the buffer by dropping oldest records audibly", function () {
+    mockEmitBatch.mockReturnValue(new Promise(function neverSettles() {}));
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+
+    // One push allowed, so the buffer genuinely backs up behind it.
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2, maxBufferRecords: 3, maxConcurrentPushes: 1 },
+    );
+
+    for (let i = 1; i <= 7; i++) {
+      batch.add(makeRecord(`msg${i}`));
+    }
+
+    expect(batch.getBufferSize()).toBe(3);
+
+    // Aggregated: one report, not one stderr write per dropped record.
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0][0]).toContain("dropped 1 oldest record(s)");
+
+    // The suppressed remainder is still reported when forced.
+    batch.stop();
+    expect(errorSpy).toHaveBeenCalledTimes(2);
+    expect(errorSpy.mock.calls[1][0]).toContain("dropped 1 oldest record(s)");
+
+    errorSpy.mockRestore();
+  });
+
+  it("re-queues records when Loki answers with a retryable status", async function () {
+    // Regression for ticket f26568f7 review finding 1: send() RESOLVES for
+    // every HTTP status, so a 429 used to sail past .catch() and the batch
+    // was discarded with nothing on stderr.
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+    mockEmitBatch.mockResolvedValueOnce({
+      ok: false,
+      statusCode: 429,
+      body: "rate limited",
+    });
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+
+    await vi.waitFor(function requeued() {
+      expect(batch.getBufferSize()).toBe(2);
+    });
+    expect(errorSpy.mock.calls[0][0]).toContain("re-queued 2 record(s)");
+
+    errorSpy.mockRestore();
+  });
+
+  it("drops rather than retries a status the server will keep rejecting", async function () {
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+    mockEmitBatch.mockResolvedValueOnce({
+      ok: false,
+      statusCode: 400,
+      body: "malformed stream",
+    });
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+
+    await vi.waitFor(function reported() {
+      expect(errorSpy).toHaveBeenCalled();
+    });
+    expect(errorSpy.mock.calls[0][0]).toContain("dropped 2 record(s)");
+    expect(batch.getBufferSize()).toBe(0);
+
+    errorSpy.mockRestore();
+  });
+
+  it("rejects a configuration that could never send", function () {
+    expect(function zeroConcurrency() {
+      return new BatchManager(
+        { url: "http://localhost:3100" },
+        {},
+        { maxConcurrentPushes: 0 },
+      );
+    }).toThrow(/maxConcurrentPushes/);
+  });
+
+  it("never lets the buffer cap sit below capacity", function () {
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 50, maxBufferRecords: 5 },
+    );
+
+    for (let i = 0; i < 50; i++) {
+      batch.add(makeRecord(`msg${i}`));
+    }
+    // Clamped to capacity, so the capacity trigger still fires.
     expect(mockEmitBatch).toHaveBeenCalledTimes(1);
   });
 });

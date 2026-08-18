@@ -54,10 +54,15 @@ export class LokiLogger {
     }
   }
 
-  close(): void {
+  /**
+   * Stop the batch timer and wait for every buffered record to be sent.
+   * Await this on shutdown — returning before the backlog lands is how a
+   * `close(); process.exit(0)` sequence loses logs.
+   */
+  async close(): Promise<void> {
     if (this.batchManager) {
-      this.batchManager.flush();
       this.batchManager.stop();
+      await this.batchManager.drain();
     }
   }
 

@@ -23,6 +23,10 @@ export interface LokiEmitterConfig {
 export interface BatchConfig {
   capacity?: number;
   flushIntervalMs?: number;
+  /** Max pushes in flight at once. Excess flushes stay buffered. */
+  maxConcurrentPushes?: number;
+  /** Hard cap on buffered records. Oldest are dropped (audibly) past this. */
+  maxBufferRecords?: number;
 }
 
 export interface LokiLoggerConfig {

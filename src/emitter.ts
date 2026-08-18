@@ -18,7 +18,6 @@ export class LokiEmitter {
   private readonly levelTag: string;
   private readonly loggerTag: string;
   private readonly replaceTimestamp: boolean;
-  private sending: boolean;
 
   constructor(
     transportConfig: LokiTransportConfig,
@@ -31,7 +30,6 @@ export class LokiEmitter {
     this.levelTag = emitterConfig.levelTag ?? DEFAULT_LEVEL_TAG;
     this.loggerTag = emitterConfig.loggerTag ?? DEFAULT_LOGGER_TAG;
     this.replaceTimestamp = emitterConfig.replaceTimestamp ?? true;
-    this.sending = false;
   }
 
   async emit(record: LogRecord): Promise<TransportResult | null> {
@@ -39,18 +37,13 @@ export class LokiEmitter {
   }
 
   async emitBatch(records: LogRecord[]): Promise<TransportResult | null> {
-    if (this.sending || records.length === 0) {
+    if (records.length === 0) {
       return null;
     }
 
-    this.sending = true;
-    try {
-      const payload = this.buildPayload(records);
-      const json = JSON.stringify(payload);
-      return await this.transport.send(json);
-    } finally {
-      this.sending = false;
-    }
+    const payload = this.buildPayload(records);
+    const json = JSON.stringify(payload);
+    return await this.transport.send(json);
   }
 
   buildPayload(records: LogRecord[]): LokiPushPayload {

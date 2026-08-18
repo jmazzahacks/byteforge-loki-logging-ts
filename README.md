@@ -111,10 +111,30 @@ const logger = new LokiLogger({
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `capacity` | `number` | `10` | Flush when buffer reaches this many records |
+| `capacity` | `number` | `10` | Flush when buffer reaches this many records; also the max records per push |
 | `flushIntervalMs` | `number` | `5000` | Flush on a timer interval (milliseconds) |
+| `maxConcurrentPushes` | `number` | `4` | Max pushes in flight at once. Beyond this, records stay buffered rather than being sent concurrently |
+| `maxBufferRecords` | `number` | `10000` | Hard cap on buffered records. Clamped up to `capacity` if set lower |
 
 The batch timer uses `unref()` so it won't prevent Node.js from exiting.
+
+### Delivery behavior
+
+Records are only removed from the buffer when a push is actually going to carry
+them, so a flush that arrives while an earlier push is still in flight does not
+lose anything.
+
+- **Retryable failures** (socket errors, HTTP 408, 429, and any 5xx) put the
+  batch back at the front of the buffer. The retry waits for the next flush
+  interval rather than firing immediately, so a struggling Loki isn't hammered.
+- **Permanent failures** (400, 401, 413 — anything the server will keep
+  rejecting) drop the batch instead of retrying forever.
+- **Buffer overflow** drops the oldest records, since the newest are the ones
+  you are most likely to still need.
+
+Every discard is reported on `stderr` with a count. Overflow reports are
+aggregated to at most one line per flush interval, so a sustained outage does
+not turn into a stderr storm.
 
 ## API
 
@@ -133,6 +153,10 @@ logger.critical("Database unreachable");
 In **direct mode** (no `batch` config), these return `Promise<TransportResult | null>`.
 In **batch mode**, these return `void` -- records are buffered.
 
+Direct mode issues one HTTP request per call with no concurrency limit, so
+`await` each call (or use batch mode) if you emit in bursts. The
+`maxConcurrentPushes` ceiling applies to batch mode only.
+
 ### flush()
 
 Force-send any buffered records immediately. Only relevant in batch mode.
@@ -143,10 +167,12 @@ logger.flush();
 
 ### close()
 
-Flush remaining records and stop the batch timer. Call this on shutdown.
+Stop the batch timer and wait for every buffered record to be sent. Returns a
+promise — **await it on shutdown**, or a `close()` immediately followed by
+`process.exit()` will drop the backlog.
 
 ```typescript
-logger.close();
+await logger.close();
 ```
 
 ## Named Loggers
