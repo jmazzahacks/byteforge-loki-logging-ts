@@ -9,6 +9,8 @@ export interface LokiTransportConfig {
   headers?: Record<string, string>;
   /** true = system CAs, false = skip verification, string = path to PEM CA bundle */
   verify?: boolean | string;
+  /** Abort a push after this many ms of socket inactivity. 0 disables. */
+  timeoutMs?: number;
 }
 
 export interface LokiEmitterConfig {

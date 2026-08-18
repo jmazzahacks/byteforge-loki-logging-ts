@@ -30,7 +30,15 @@ Four layers, each usable standalone and all re-exported from `src/index.ts`:
   (including the Basic auth header) and TLS options. A `verify` string is read from
   disk with `readFileSync` **once, in the constructor** — CA rotation requires a new
   instance. `send()` resolves with a `TransportResult` for any HTTP response
-  (`ok` is strictly `statusCode === 204`) and only rejects on socket-level errors.
+  (`ok` is strictly `statusCode === 204`) and only rejects on socket-level errors —
+  callers must therefore inspect `result.ok`, since a 429 is a *resolved* promise.
+  `req.setTimeout` (`timeoutMs`, default 30s) guards every push: Node's default
+  socket timeout is 0, so without it an accepted-but-unanswered request never
+  settles and strands a concurrency slot. Note it is a socket *inactivity* timer
+  that resets on every byte, **not** a total request deadline — a trickled
+  response will never trip it. A timeout raises `LokiTimeoutError`, which
+  `BatchManager` deliberately treats as non-retryable: the body was already sent,
+  so retrying risks duplicating records Loki may have ingested.
 
 - **`LokiEmitter`** (`src/emitter.ts`) — record → Loki payload. `buildPayload()`
   groups records into streams by their sanitized label set (the map key is the

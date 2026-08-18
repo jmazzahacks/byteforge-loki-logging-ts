@@ -6,6 +6,7 @@ import {
   RETRYABLE_STATUS_CODES,
 } from "./constants.js";
 import { LokiEmitter } from "./emitter.js";
+import { LokiTimeoutError } from "./transport.js";
 import type {
   BatchConfig,
   LogRecord,
@@ -123,11 +124,28 @@ export class BatchManager {
         if (result && !result.ok) {
           // send() resolves for every HTTP status — only sockets reject —
           // so a non-2xx has to be handled here or it vanishes silently.
-          requeued = self.handleFailure(records, result.statusCode, result.body);
+          // A rejected push was NOT ingested, so retrying cannot duplicate.
+          requeued = self.handleFailure(
+            records,
+            `HTTP ${result.statusCode}`,
+            result.body,
+            isRetryable(result.statusCode),
+          );
         }
       })
       .catch(function onSocketError(err: unknown) {
-        requeued = self.handleFailure(records, null, String(err));
+        // A timeout is the one ambiguous failure: the body was already sent,
+        // so Loki may have ingested the batch and only the ack was lost.
+        // Retrying would duplicate — and since replaceTimestamp restamps each
+        // copy, Loki cannot dedupe them. Prefer losing the batch loudly over
+        // amplifying a slow Loki into a duplicate storm.
+        const timedOut = err instanceof LokiTimeoutError;
+        requeued = self.handleFailure(
+          records,
+          timedOut ? "timed out" : "request failed",
+          String(err),
+          !timedOut,
+        );
       })
       .finally(function onSettled() {
         self.pending.delete(push);
@@ -169,21 +187,18 @@ export class BatchManager {
   }
 
   /**
-   * A failed push is put back at the front of the buffer for retryable
-   * conditions, so the interval timer paces the retry. Anything the server
-   * will keep rejecting (400 for a malformed stream, 401, 413) is dropped
-   * rather than retried forever — but never silently.
+   * A failed push is put back at the front of the buffer when the failure is
+   * retryable, so the interval timer paces the retry. Anything the server
+   * will keep rejecting (400 for a malformed stream, 401, 413) — and anything
+   * that may have already landed (a timeout) — is dropped rather than retried,
+   * but never silently.
    */
   private handleFailure(
     records: LogRecord[],
-    statusCode: number | null,
+    reason: string,
     detail: string,
+    retryable: boolean,
   ): boolean {
-    // A null status means the socket itself failed, which is always worth
-    // another attempt.
-    const reason = statusCode === null ? "request failed" : `HTTP ${statusCode}`;
-    const retryable = statusCode === null || isRetryable(statusCode);
-
     if (retryable && !this.draining) {
       this.buffer = records.concat(this.buffer);
       this.enforceBufferLimit();

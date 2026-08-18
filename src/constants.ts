@@ -6,6 +6,7 @@ export const DEFAULT_BATCH_CAPACITY = 10;
 export const DEFAULT_FLUSH_INTERVAL_MS = 5000;
 export const DEFAULT_MAX_CONCURRENT_PUSHES = 4;
 export const DEFAULT_MAX_BUFFER_RECORDS = 10000;
+export const DEFAULT_TIMEOUT_MS = 30000;
 
 /** Statuses worth retrying; anything >= 500 is also retried. */
 export const RETRYABLE_STATUS_CODES = [408, 429];

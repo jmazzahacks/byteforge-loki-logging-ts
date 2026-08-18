@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as http from "node:http";
-import { LokiTransport } from "../src/transport.js";
+import { LokiTransport, LokiTimeoutError } from "../src/transport.js";
 
 describe("LokiTransport", function () {
   let server: http.Server;
@@ -8,9 +8,13 @@ describe("LokiTransport", function () {
   let lastRequestBody: string;
   let lastRequestHeaders: http.IncomingHttpHeaders;
   let responseCode: number;
+  let hangRequest: boolean;
+  let responseDelayMs: number;
 
   beforeEach(function () {
     responseCode = 204;
+    hangRequest = false;
+    responseDelayMs = 0;
     lastRequestBody = "";
     lastRequestHeaders = {};
 
@@ -28,8 +32,13 @@ describe("LokiTransport", function () {
 
         req.on("end", function respond() {
           lastRequestBody = Buffer.concat(chunks).toString("utf-8");
-          res.writeHead(responseCode);
-          res.end();
+          if (hangRequest) {
+            return; // accepted, never answered
+          }
+          setTimeout(function sendResponse() {
+            res.writeHead(responseCode);
+            res.end();
+          }, responseDelayMs);
         });
       });
 
@@ -119,5 +128,103 @@ describe("LokiTransport", function () {
     await transport.send("{}");
 
     expect(requestPath).toBe("/loki/api/v1/push");
+  });
+
+  it("rejects when the server accepts the request and never answers", async function () {
+    // Regression for ticket f26568f7 defect 2: with no timeout this promise
+    // never settled, holding a push slot for the life of the process.
+    hangRequest = true;
+
+    const transport = new LokiTransport({
+      url: `http://localhost:${port}`,
+      timeoutMs: 150,
+    });
+
+    await expect(transport.send(JSON.stringify({ streams: [] }))).rejects.toThrow(
+      /timed out after 150ms/,
+    );
+  });
+
+  it("does not time out a response that arrives within the budget", async function () {
+    responseDelayMs = 100;
+
+    const transport = new LokiTransport({
+      url: `http://localhost:${port}`,
+      timeoutMs: 1000,
+    });
+
+    const result = await transport.send(JSON.stringify({ streams: [] }));
+    expect(result.ok).toBe(true);
+    expect(result.statusCode).toBe(204);
+  });
+
+  it("survives a timeout racing an arriving response without an unhandled error", async function () {
+    // Destroying a timed-out request can surface an "error" event while the
+    // response is already arriving. A promise cannot settle twice, so what is
+    // actually worth asserting is that neither path escapes as an unhandled
+    // rejection or an uncaught exception.
+    responseDelayMs = 60;
+
+    const escaped: unknown[] = [];
+    function captureEscape(err: unknown): void {
+      escaped.push(err);
+    }
+    process.on("unhandledRejection", captureEscape);
+    process.on("uncaughtException", captureEscape);
+
+    const transport = new LokiTransport({
+      url: `http://localhost:${port}`,
+      timeoutMs: 60,
+    });
+
+    // Either outcome is legitimate; the race decides which.
+    let outcome = "";
+    await transport
+      .send(JSON.stringify({ streams: [] }))
+      .then(function onSuccess() {
+        outcome = "resolved";
+      })
+      .catch(function onFailure(err: Error) {
+        outcome = err.name;
+      });
+
+    await new Promise(function wait(resolve) {
+      setTimeout(resolve, 250);
+    });
+
+    process.off("unhandledRejection", captureEscape);
+    process.off("uncaughtException", captureEscape);
+
+    expect(["resolved", "LokiTimeoutError"]).toContain(outcome);
+    expect(escaped).toEqual([]);
+  });
+
+  it("rejects a timeoutMs that would silently disarm the timeout", function () {
+    expect(function notANumber() {
+      return new LokiTransport({
+        url: `http://localhost:${port}`,
+        timeoutMs: Number("not-a-number"),
+      });
+    }).toThrow(/timeoutMs/);
+
+    expect(function negative() {
+      return new LokiTransport({
+        url: `http://localhost:${port}`,
+        timeoutMs: -1,
+      });
+    }).toThrow(/timeoutMs/);
+  });
+
+  it("surfaces a timeout as a typed LokiTimeoutError", async function () {
+    hangRequest = true;
+
+    const transport = new LokiTransport({
+      url: `http://localhost:${port}`,
+      timeoutMs: 120,
+    });
+
+    await expect(
+      transport.send(JSON.stringify({ streams: [] })),
+    ).rejects.toBeInstanceOf(LokiTimeoutError);
   });
 });

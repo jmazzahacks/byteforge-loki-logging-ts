@@ -1,6 +1,6 @@
 export { LokiLogger } from "./logger.js";
 export { LokiEmitter } from "./emitter.js";
-export { LokiTransport } from "./transport.js";
+export { LokiTransport, LokiTimeoutError } from "./transport.js";
 export { BatchManager } from "./batch.js";
 export { sanitizeLabel, sanitizeLabels } from "./labels.js";
 export {
@@ -12,6 +12,7 @@ export {
   DEFAULT_FLUSH_INTERVAL_MS,
   DEFAULT_MAX_CONCURRENT_PUSHES,
   DEFAULT_MAX_BUFFER_RECORDS,
+  DEFAULT_TIMEOUT_MS,
   RETRYABLE_STATUS_CODES,
 } from "./constants.js";
 export type {

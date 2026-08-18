@@ -57,6 +57,7 @@ const logger = new LokiLogger({
     auth: { username: "user", password: "pass" },
     headers: { "X-Scope-OrgID": "tenant-1" },
     verify: "/path/to/ca.pem",
+    timeoutMs: 30000,
   },
 });
 ```
@@ -67,6 +68,7 @@ const logger = new LokiLogger({
 | `auth` | `{ username, password }` | `undefined` | Basic authentication credentials |
 | `headers` | `Record<string, string>` | `{}` | Additional HTTP headers |
 | `verify` | `boolean \| string` | `true` | `true` = system CAs, `false` = skip TLS verification, `string` = path to PEM CA bundle |
+| `timeoutMs` | `number` | `30000` | Abort a push after this many ms of socket inactivity. `0` disables the timeout |
 
 ### Emitter
 
@@ -118,17 +120,40 @@ const logger = new LokiLogger({
 
 The batch timer uses `unref()` so it won't prevent Node.js from exiting.
 
+### Request timeouts
+
+Node's default socket timeout is `0` (never), so a Loki that accepts a
+connection and never answers would otherwise leave the push pending forever —
+holding a concurrency slot and stalling `close()`. Pushes therefore abort after
+`transport.timeoutMs` and reject with a `LokiTimeoutError`.
+
+Note this is a socket **inactivity** timer, not a total request deadline: it
+resets on every byte, so a response that trickles will not trip it.
+
+A timed-out batch is **not retried**, unlike other failures. The request body
+was already sent, so Loki may have ingested the records and only the
+acknowledgement was lost — retrying would duplicate them, and because
+`replaceTimestamp` restamps each copy Loki cannot dedupe them. The batch is
+dropped and reported on `stderr` instead. That is why the default is a
+deliberately generous 30s: a timeout should mean something is genuinely wrong,
+not that Loki was briefly busy. Lower it only if you would rather lose a slow
+batch than hold a push slot.
+
 ### Delivery behavior
 
 Records are only removed from the buffer when a push is actually going to carry
 them, so a flush that arrives while an earlier push is still in flight does not
 lose anything.
 
-- **Retryable failures** (socket errors, HTTP 408, 429, and any 5xx) put the
-  batch back at the front of the buffer. The retry waits for the next flush
-  interval rather than firing immediately, so a struggling Loki isn't hammered.
+- **Retryable failures** — connection errors, HTTP 408, 429, and any 5xx — put
+  the batch back at the front of the buffer. These are all cases where Loki
+  demonstrably did *not* ingest the records, so a retry cannot duplicate them.
+  The retry waits for the next flush interval rather than firing immediately,
+  so a struggling Loki isn't hammered.
 - **Permanent failures** (400, 401, 413 — anything the server will keep
   rejecting) drop the batch instead of retrying forever.
+- **Timeouts** drop the batch too, because whether it was ingested is unknowable
+  (see above).
 - **Buffer overflow** drops the oldest records, since the newest are the ones
   you are most likely to still need.
 
