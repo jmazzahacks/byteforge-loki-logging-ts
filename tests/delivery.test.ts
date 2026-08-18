@@ -14,6 +14,8 @@ interface Stub {
   server: http.Server;
   url: string;
   received: string[];
+  /** Raw [nanosecondTimestamp, message] pairs, per push, in arrival order. */
+  entries: [string, string][];
   requestCount: number;
 }
 
@@ -21,9 +23,13 @@ interface Stub {
  * @param responseDelayMs how long to wait before answering 204
  * @param hangRequests    how many leading requests to accept and never answer
  */
-function startStub(responseDelayMs: number, hangRequests: number = 0): Promise<Stub> {
+function startStub(
+  responseDelayMs: number,
+  hangRequests: number = 0,
+  failRequests: number = 0,
+): Promise<Stub> {
   return new Promise(function (resolve) {
-    const stub: Partial<Stub> = { received: [], requestCount: 0 };
+    const stub: Partial<Stub> = { received: [], entries: [], requestCount: 0 };
 
     const server = http.createServer(function handleRequest(
       req: http.IncomingMessage,
@@ -41,11 +47,18 @@ function startStub(responseDelayMs: number, hangRequests: number = 0): Promise<S
           return; // accepted, never answered
         }
 
-        // Counted at receipt, before the (possibly delayed) 204.
+        // Counted at receipt, before the (possibly delayed) response.
         for (const stream of payload.streams) {
           for (const value of stream.values) {
+            stub.entries?.push([value[0], JSON.parse(value[1]).message]);
             stub.received?.push(JSON.parse(value[1]).message);
           }
+        }
+
+        if ((stub.requestCount ?? 0) <= hangRequests + failRequests) {
+          res.writeHead(503);
+          res.end();
+          return;
         }
         setTimeout(function sendResponse() {
           res.writeHead(204);
@@ -153,6 +166,47 @@ describe("delivery guarantees", function () {
       return String(call[0]).includes("timed out") && String(call[0]).includes("dropped 2 record(s)");
     });
     expect(reported).toBe(true);
+
+    errorSpy.mockRestore();
+  });
+
+  it("keeps a retried record's original timestamp", async function () {
+    // Regression: replaceTimestamp used to restamp at payload-build time, so
+    // a retry landed in Loki LATER than events that actually followed it.
+    // This must run against the real emitter with real timers — mocking the
+    // emitter makes the fix unobservable.
+    stub = await startStub(0, 0, 1); // first push 503s, then succeeds
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+
+    const logger = new LokiLogger(
+      {
+        transport: { url: stub.url },
+        emitter: { tags: { app: "repro" }, asJson: true, replaceTimestamp: true },
+        batch: { capacity: 2, flushIntervalMs: 300 },
+      },
+      "repro",
+    );
+
+    logger.info("RETRIED-1");
+    logger.info("RETRIED-2");
+
+    await delay(800); // long enough for the 300ms-paced retry to land
+    await logger.close();
+
+    const stamps = stub.entries
+      .filter(function isTarget(entry) {
+        return entry[1] === "RETRIED-1";
+      })
+      .map(function toStamp(entry) {
+        return entry[0];
+      });
+
+    // Seen twice: the failed push and the retry.
+    expect(stamps.length).toBe(2);
+    // Pre-fix these differed by the ~300ms retry delay.
+    expect(stamps[1]).toBe(stamps[0]);
 
     errorSpy.mockRestore();
   });

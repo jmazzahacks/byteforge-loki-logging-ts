@@ -29,6 +29,9 @@ export class BatchManager {
   private timer: ReturnType<typeof setInterval> | null;
   private readonly pending: Set<Promise<void>>;
   private draining: boolean;
+  private closed: boolean;
+  private reportedCloseRejection: boolean;
+  private readonly stampOnAdd: boolean;
   private droppedSinceReport: number;
   private lastDropReportMs: number;
 
@@ -37,7 +40,15 @@ export class BatchManager {
     emitterConfig: LokiEmitterConfig = {},
     batchConfig: BatchConfig = {},
   ) {
-    this.emitter = new LokiEmitter(transportConfig, emitterConfig);
+    // Stamp when the record is accepted, not when the payload is built, so a
+    // retried batch keeps its original time. Restamping on retry pushed records
+    // *later* than events that actually followed them, corrupting the timeline
+    // in Loki.
+    this.stampOnAdd = emitterConfig.replaceTimestamp ?? true;
+    this.emitter = new LokiEmitter(transportConfig, {
+      ...emitterConfig,
+      replaceTimestamp: false,
+    });
     this.capacity = batchConfig.capacity ?? DEFAULT_BATCH_CAPACITY;
     this.flushIntervalMs =
       batchConfig.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
@@ -68,12 +79,28 @@ export class BatchManager {
     this.timer = null;
     this.pending = new Set();
     this.draining = false;
+    this.closed = false;
+    this.reportedCloseRejection = false;
     this.droppedSinceReport = 0;
     this.lastDropReportMs = 0;
   }
 
   add(record: LogRecord): void {
-    this.buffer.push(record);
+    if (this.closed) {
+      // Buffering here would also make drain() unbounded, since every late
+      // record re-arms its loop.
+      if (!this.reportedCloseRejection) {
+        console.error(
+          "byteforge-loki: record(s) logged after close() are dropped (further reports suppressed)",
+        );
+        this.reportedCloseRejection = true;
+      }
+      return;
+    }
+
+    this.buffer.push(
+      this.stampOnAdd ? { ...record, timestampMs: Date.now() } : record,
+    );
     this.enforceBufferLimit();
     if (this.buffer.length >= this.capacity) {
       this.flush();
@@ -111,7 +138,13 @@ export class BatchManager {
 
     // Chunk at capacity: a backlog built up behind the ceiling must not be
     // posted as one oversized request that Loki would reject wholesale.
-    const records = this.buffer.splice(0, this.capacity);
+    this.sendChunk(this.buffer.splice(0, this.capacity));
+  }
+
+  private sendChunk(records: LogRecord[]): void {
+    if (records.length === 0) {
+      return;
+    }
     const self = this;
     // A re-queued batch must NOT trigger the drain below, or a persistently
     // failing Loki would be retried as fast as the network allows. Letting
@@ -157,25 +190,44 @@ export class BatchManager {
     this.pending.add(push);
   }
 
-  /**
-   * Flush everything and wait for it to land. Unlike `flush()` this settles
-   * only once the buffer is empty and no push is outstanding, so a caller
-   * can shut down without stranding the backlog. Failures are not retried
-   * while draining — otherwise a dead Loki would never let shutdown finish.
+   /**
+   * Deliver the records buffered at the moment of the call and wait for them
+   * to land. Records added *during* the drain are NOT included and stay
+   * buffered — bounding the work is what stops a service that logs while
+   * shutting down from keeping this from ever resolving.
+   *
+   * For shutdown use `close()`, which stops accepting records first so
+   * nothing is left behind. Failures are not retried while draining, since a
+   * dead Loki would otherwise never let shutdown finish.
    */
   async drain(): Promise<void> {
     this.draining = true;
     try {
-      while (this.buffer.length > 0 || this.pending.size > 0) {
-        this.flush();
-        if (this.pending.size > 0) {
-          await Promise.all(Array.from(this.pending));
+      // Bounded by what is buffered on entry. Without this, anything still
+      // logging during shutdown re-arms the loop and close() never returns —
+      // the process then dies by SIGKILL, losing the very buffer drain()
+      // exists to deliver.
+      let remaining = this.buffer.length;
+      while (remaining > 0 || this.pending.size > 0) {
+        if (remaining > 0 && this.pending.size < this.maxConcurrentPushes) {
+          const take = Math.min(this.capacity, remaining);
+          remaining -= take;
+          this.sendChunk(this.buffer.splice(0, take));
+          continue;
         }
+        await Promise.all(Array.from(this.pending));
       }
     } finally {
       this.draining = false;
       this.reportDrops(true);
     }
+  }
+
+  /** Stop accepting records, stop the timer, and deliver what is buffered. */
+  async close(): Promise<void> {
+    this.closed = true;
+    this.stop();
+    await this.drain();
   }
 
   getBufferSize(): number {
@@ -200,10 +252,30 @@ export class BatchManager {
     retryable: boolean,
   ): boolean {
     if (retryable && !this.draining) {
-      this.buffer = records.concat(this.buffer);
-      this.enforceBufferLimit();
+      // Make room explicitly rather than re-queueing and then letting
+      // enforceBufferLimit() trim from the front — the front is exactly the
+      // batch just put back, so the retry would be destroyed microseconds
+      // after stderr announced it had been re-queued.
+      const room = this.maxBufferRecords - this.buffer.length;
+      if (room <= 0) {
+        console.error(
+          `byteforge-loki: push ${reason}, dropped ${records.length} record(s) — buffer full at ${this.maxBufferRecords}`,
+          detail,
+        );
+        return false;
+      }
+
+      // If only part of the batch fits, keep its newest records.
+      const kept = records.slice(Math.max(0, records.length - room));
+      this.buffer = kept.concat(this.buffer);
+
+      const dropped = records.length - kept.length;
+      const suffix =
+        dropped > 0
+          ? `, dropped ${dropped} — buffer full at ${this.maxBufferRecords}`
+          : "";
       console.error(
-        `byteforge-loki: push ${reason}, re-queued ${records.length} record(s)`,
+        `byteforge-loki: push ${reason}, re-queued ${kept.length} record(s)${suffix}`,
         detail,
       );
       return true;

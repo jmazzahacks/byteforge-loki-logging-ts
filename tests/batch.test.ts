@@ -306,4 +306,82 @@ describe("BatchManager", function () {
     // Clamped to capacity, so the capacity trigger still fires.
     expect(mockEmitBatch).toHaveBeenCalledTimes(1);
   });
+
+  it("does not destroy the batch it just re-queued when the buffer is full", async function () {
+    // Re-queueing at the front and then trimming from the front dropped the
+    // retry itself, while stderr announced it had been re-queued.
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+    mockEmitBatch.mockResolvedValueOnce({
+      ok: false,
+      statusCode: 500,
+      body: "boom",
+    });
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 5, maxBufferRecords: 5, maxConcurrentPushes: 1 },
+    );
+
+    for (let i = 1; i <= 5; i++) {
+      batch.add(makeRecord(`FIRST-${i}`));
+    }
+    for (let i = 1; i <= 5; i++) {
+      batch.add(makeRecord(`SECOND-${i}`));
+    }
+
+    await vi.waitFor(function settled() {
+      expect(errorSpy).toHaveBeenCalled();
+    });
+
+    // The buffer was already full, so the batch genuinely cannot be kept —
+    // but it must be reported as dropped, not as re-queued.
+    const messages = errorSpy.mock.calls.map(function first(call) {
+      return String(call[0]);
+    });
+    const claimsRequeued = messages.some(function requeued(m) {
+      return m.includes("re-queued");
+    });
+    const reportsDrop = messages.some(function dropped(m) {
+      return m.includes("dropped 5 record(s)") && m.includes("buffer full");
+    });
+    expect(claimsRequeued).toBe(false);
+    expect(reportsDrop).toBe(true);
+
+    errorSpy.mockRestore();
+  });
+
+  it("drops records logged after close() instead of hanging the drain", async function () {
+    vi.useRealTimers();
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2, flushIntervalMs: 50 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+
+    // A service still logging while shutting down used to re-arm drain()
+    // forever; close() must still resolve.
+    const closing = batch.close();
+    for (let i = 0; i < 100; i++) {
+      batch.add(makeRecord(`LATE-${i}`));
+    }
+    await closing;
+
+    expect(batch.getBufferSize()).toBe(0);
+    const warned = errorSpy.mock.calls.some(function afterClose(call) {
+      return String(call[0]).includes("after close()");
+    });
+    expect(warned).toBe(true);
+
+    errorSpy.mockRestore();
+  });
 });

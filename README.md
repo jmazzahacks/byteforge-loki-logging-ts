@@ -95,7 +95,7 @@ const logger = new LokiLogger({
 | `propsToLabels` | `string[]` | `[]` | Keys from `extra` to promote to Loki labels |
 | `levelTag` | `string` | `"severity"` | Label name for the log level |
 | `loggerTag` | `string` | `"logger"` | Label name for the logger name |
-| `replaceTimestamp` | `boolean` | `true` | Use current time instead of the record's timestamp |
+| `replaceTimestamp` | `boolean` | `true` | Use current time instead of the record's timestamp. In batch mode the stamp is taken when the record is accepted, so a retried batch keeps its original time rather than jumping ahead of events that followed it |
 
 ### Batch
 
@@ -155,7 +155,8 @@ lose anything.
 - **Timeouts** drop the batch too, because whether it was ingested is unknowable
   (see above).
 - **Buffer overflow** drops the oldest records, since the newest are the ones
-  you are most likely to still need.
+  you are most likely to still need. A retried batch that no longer fits is
+  reported as dropped, not as re-queued.
 
 Every discard is reported on `stderr` with a count. Overflow reports are
 aggregated to at most one line per flush interval, so a sustained outage does
@@ -192,13 +193,19 @@ logger.flush();
 
 ### close()
 
-Stop the batch timer and wait for every buffered record to be sent. Returns a
+Stop the batch timer and wait for the buffered records to be sent. Returns a
 promise — **await it on shutdown**, or a `close()` immediately followed by
 `process.exit()` will drop the backlog.
 
 ```typescript
 await logger.close();
 ```
+
+`close()` drains the records buffered at the moment it is called. Anything
+logged *after* it is dropped, and reported once on `stderr`. That is deliberate:
+a service still logging while it shuts down would otherwise keep re-arming the
+drain and `close()` would never resolve — leaving the process to be SIGKILLed,
+which loses the entire buffer rather than saving it.
 
 ## Named Loggers
 

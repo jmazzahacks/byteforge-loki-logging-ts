@@ -59,8 +59,15 @@ Four layers, each usable standalone and all re-exported from `src/index.ts`:
   push drains whatever accumulated, except after a re-queue — draining there would
   retry a failing Loki as fast as the network allows, so the interval timer paces
   it instead. `flush()` chunks at `capacity` so a backlog is never posted as one
-  oversized request. `drain()` (awaited by `LokiLogger.close()`) is the only way to
-  know the backlog landed.
+  oversized request. `close()` (awaited by `LokiLogger.close()`) is the only way to
+  know the backlog landed; it stops accepting records first, because `drain()`
+  is bounded by what is buffered on entry — an unbounded version livelocks when
+  a service logs while shutting down. Retries are re-queued at the front, and
+  `handleFailure` must make room *before* concat: trimming afterwards drops from
+  the front, which is the batch just re-queued.
+  Batch mode stamps timestamps at `add()` and constructs its emitter with
+  `replaceTimestamp: false`, so a retry cannot restamp a record later than
+  events that followed it.
   Because `LokiTransport.send()` **resolves** for every HTTP status, non-2xx
   handling lives in the `.then()`, not the `.catch()` — a `.catch()`-only flush is
   how 429s used to vanish. Every discard path must stay audible on stderr.

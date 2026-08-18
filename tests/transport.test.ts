@@ -9,11 +9,13 @@ describe("LokiTransport", function () {
   let lastRequestHeaders: http.IncomingHttpHeaders;
   let responseCode: number;
   let hangRequest: boolean;
+  let stallAfterHeaders: boolean;
   let responseDelayMs: number;
 
   beforeEach(function () {
     responseCode = 204;
     hangRequest = false;
+    stallAfterHeaders = false;
     responseDelayMs = 0;
     lastRequestBody = "";
     lastRequestHeaders = {};
@@ -34,6 +36,13 @@ describe("LokiTransport", function () {
           lastRequestBody = Buffer.concat(chunks).toString("utf-8");
           if (hangRequest) {
             return; // accepted, never answered
+          }
+          if (stallAfterHeaders) {
+            // Headers and a partial body land, then the socket goes quiet —
+            // so the timeout is guaranteed to fire mid-response.
+            res.writeHead(204);
+            res.write("");
+            return;
           }
           setTimeout(function sendResponse() {
             res.writeHead(responseCode);
@@ -158,12 +167,11 @@ describe("LokiTransport", function () {
     expect(result.statusCode).toBe(204);
   });
 
-  it("survives a timeout racing an arriving response without an unhandled error", async function () {
+  it("times out cleanly when the response stalls mid-body", async function () {
     // Destroying a timed-out request can surface an "error" event while the
-    // response is already arriving. A promise cannot settle twice, so what is
-    // actually worth asserting is that neither path escapes as an unhandled
-    // rejection or an uncaught exception.
-    responseDelayMs = 60;
+    // response is already arriving. Headers-then-stall makes that path
+    // deterministic rather than relying on a timing tie.
+    stallAfterHeaders = true;
 
     const escaped: unknown[] = [];
     function captureEscape(err: unknown): void {
@@ -177,7 +185,6 @@ describe("LokiTransport", function () {
       timeoutMs: 60,
     });
 
-    // Either outcome is legitimate; the race decides which.
     let outcome = "";
     await transport
       .send(JSON.stringify({ streams: [] }))
@@ -195,7 +202,7 @@ describe("LokiTransport", function () {
     process.off("unhandledRejection", captureEscape);
     process.off("uncaughtException", captureEscape);
 
-    expect(["resolved", "LokiTimeoutError"]).toContain(outcome);
+    expect(outcome).toBe("LokiTimeoutError");
     expect(escaped).toEqual([]);
   });
 
