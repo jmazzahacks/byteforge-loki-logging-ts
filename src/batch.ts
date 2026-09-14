@@ -19,6 +19,20 @@ function isRetryable(statusCode: number): boolean {
   return RETRYABLE_STATUS_CODES.includes(statusCode) || statusCode >= 500;
 }
 
+/**
+ * Label Loki's response body. Appended raw it read as a formatting bug —
+ * "re-queued 20 record(s) empty ring" is Loki's own 500 body, trailing
+ * newline and all (ticket f59278b2).
+ */
+function describeResponse(body: string): string {
+  const trimmed = body.trim();
+  return trimmed ? `response: ${JSON.stringify(trimmed)}` : "";
+}
+
+function withDetail(message: string, detail: string): string {
+  return detail ? `${message}; ${detail}` : message;
+}
+
 export class BatchManager {
   private readonly emitter: LokiEmitter;
   private readonly capacity: number;
@@ -34,6 +48,9 @@ export class BatchManager {
   private readonly stampOnAdd: boolean;
   private droppedSinceReport: number;
   private lastDropReportMs: number;
+  private droppedTotal: number;
+  /** Records that have already timed out once; see handleTimeout(). */
+  private readonly timedOutOnce: WeakSet<LogRecord> = new WeakSet();
 
   constructor(
     transportConfig: LokiTransportConfig,
@@ -83,12 +100,14 @@ export class BatchManager {
     this.reportedCloseRejection = false;
     this.droppedSinceReport = 0;
     this.lastDropReportMs = 0;
+    this.droppedTotal = 0;
   }
 
   add(record: LogRecord): void {
     if (this.closed) {
       // Buffering here would also make drain() unbounded, since every late
       // record re-arms its loop.
+      this.droppedTotal += 1;
       if (!this.reportedCloseRejection) {
         console.error(
           "byteforge-loki: record(s) logged after close() are dropped (further reports suppressed)",
@@ -161,24 +180,17 @@ export class BatchManager {
           requeued = self.handleFailure(
             records,
             `HTTP ${result.statusCode}`,
-            result.body,
+            describeResponse(result.body),
             isRetryable(result.statusCode),
           );
         }
       })
       .catch(function onSocketError(err: unknown) {
-        // A timeout is the one ambiguous failure: the body was already sent,
-        // so Loki may have ingested the batch and only the ack was lost.
-        // Retrying would duplicate — and since replaceTimestamp restamps each
-        // copy, Loki cannot dedupe them. Prefer losing the batch loudly over
-        // amplifying a slow Loki into a duplicate storm.
-        const timedOut = err instanceof LokiTimeoutError;
-        requeued = self.handleFailure(
-          records,
-          timedOut ? "timed out" : "request failed",
-          String(err),
-          !timedOut,
-        );
+        if (err instanceof LokiTimeoutError) {
+          requeued = self.handleTimeout(records, String(err));
+          return;
+        }
+        requeued = self.handleFailure(records, "request failed", String(err), true);
       })
       .finally(function onSettled() {
         self.pending.delete(push);
@@ -188,6 +200,45 @@ export class BatchManager {
       });
 
     this.pending.add(push);
+  }
+
+  /**
+   * Retry a timed-out record once, then drop it. The body was already sent,
+   * so Loki may have ingested it; the retry is still safe because records are
+   * stamped at add() and the emitter never restamps, so the copy is
+   * byte-identical and Loki discards an entry whose stream, timestamp and line
+   * match one it already holds (ticket f59278b2).
+   *
+   * Only once, because a Loki that ingests but acks slower than timeoutMs
+   * would otherwise be sent the same records on every flush forever —
+   * starving newer records until the buffer overflowed, and reporting as loss
+   * records Loki actually holds.
+   */
+  private handleTimeout(records: LogRecord[], detail: string): boolean {
+    const fresh: LogRecord[] = [];
+    let exhausted = 0;
+    for (const record of records) {
+      if (this.timedOutOnce.has(record)) {
+        exhausted += 1;
+      } else {
+        this.timedOutOnce.add(record);
+        fresh.push(record);
+      }
+    }
+
+    if (exhausted > 0) {
+      this.droppedTotal += exhausted;
+      console.error(
+        withDetail(
+          `byteforge-loki: push timed out again, dropped ${exhausted} record(s) ${this.droppedTotalNote()} — Loki may have ingested them`,
+          detail,
+        ),
+      );
+    }
+    if (fresh.length === 0) {
+      return false;
+    }
+    return this.handleFailure(fresh, "timed out", detail, true);
   }
 
    /**
@@ -239,11 +290,19 @@ export class BatchManager {
   }
 
   /**
+   * Records discarded over this manager's lifetime, by every path: permanent
+   * failures, a second timeout, failures while draining, buffer overflow, and
+   * records logged after close(). Poll it to alert on loss rather than reading stderr.
+   */
+  getDroppedCount(): number {
+    return this.droppedTotal;
+  }
+
+  /**
    * A failed push is put back at the front of the buffer when the failure is
    * retryable, so the interval timer paces the retry. Anything the server
-   * will keep rejecting (400 for a malformed stream, 401, 413) — and anything
-   * that may have already landed (a timeout) — is dropped rather than retried,
-   * but never silently.
+   * will keep rejecting (400 for a malformed stream, 401, 413) is dropped
+   * rather than retried, but never silently.
    */
   private handleFailure(
     records: LogRecord[],
@@ -258,9 +317,12 @@ export class BatchManager {
       // after stderr announced it had been re-queued.
       const room = this.maxBufferRecords - this.buffer.length;
       if (room <= 0) {
+        this.droppedTotal += records.length;
         console.error(
-          `byteforge-loki: push ${reason}, dropped ${records.length} record(s) — buffer full at ${this.maxBufferRecords}`,
-          detail,
+          withDetail(
+            `byteforge-loki: push ${reason}, dropped ${records.length} record(s) ${this.droppedTotalNote()} — buffer full at ${this.maxBufferRecords}`,
+            detail,
+          ),
         );
         return false;
       }
@@ -270,22 +332,32 @@ export class BatchManager {
       this.buffer = kept.concat(this.buffer);
 
       const dropped = records.length - kept.length;
+      this.droppedTotal += dropped;
       const suffix =
         dropped > 0
-          ? `, dropped ${dropped} — buffer full at ${this.maxBufferRecords}`
+          ? `, dropped ${dropped} ${this.droppedTotalNote()} — buffer full at ${this.maxBufferRecords}`
           : "";
       console.error(
-        `byteforge-loki: push ${reason}, re-queued ${kept.length} record(s)${suffix}`,
-        detail,
+        withDetail(
+          `byteforge-loki: push ${reason}, re-queued ${kept.length} record(s)${suffix}`,
+          detail,
+        ),
       );
       return true;
     }
 
+    this.droppedTotal += records.length;
     console.error(
-      `byteforge-loki: push ${reason}, dropped ${records.length} record(s)`,
-      detail,
+      withDetail(
+        `byteforge-loki: push ${reason}, dropped ${records.length} record(s) ${this.droppedTotalNote()}`,
+        detail,
+      ),
     );
     return false;
+  }
+
+  private droppedTotalNote(): string {
+    return `(${this.droppedTotal} dropped total)`;
   }
 
   /**
@@ -300,6 +372,7 @@ export class BatchManager {
     }
     this.buffer.splice(0, overflow);
     this.droppedSinceReport += overflow;
+    this.droppedTotal += overflow;
     this.reportDrops(false);
   }
 
@@ -318,7 +391,7 @@ export class BatchManager {
       return;
     }
     console.error(
-      `byteforge-loki: buffer full at ${this.maxBufferRecords} records, dropped ${this.droppedSinceReport} oldest record(s)`,
+      `byteforge-loki: buffer full at ${this.maxBufferRecords} records, dropped ${this.droppedSinceReport} oldest record(s) ${this.droppedTotalNote()}`,
     );
     this.droppedSinceReport = 0;
     this.lastDropReportMs = now;

@@ -67,6 +67,15 @@ export class LokiLogger {
     }
   }
 
+  /**
+   * Records discarded over this logger's lifetime — see
+   * `BatchManager.getDroppedCount()`. Always 0 in direct mode, where every
+   * failure surfaces on the promise the log call returns instead.
+   */
+  getDroppedCount(): number {
+    return this.batchManager ? this.batchManager.getDroppedCount() : 0;
+  }
+
   private log(
     level: string,
     message: string,

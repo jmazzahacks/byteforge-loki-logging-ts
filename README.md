@@ -130,14 +130,17 @@ holding a concurrency slot and stalling `close()`. Pushes therefore abort after
 Note this is a socket **inactivity** timer, not a total request deadline: it
 resets on every byte, so a response that trickles will not trip it.
 
-A timed-out batch is **not retried**, unlike other failures. The request body
-was already sent, so Loki may have ingested the records and only the
-acknowledgement was lost — retrying would duplicate them, and because
-`replaceTimestamp` restamps each copy Loki cannot dedupe them. The batch is
-dropped and reported on `stderr` instead. That is why the default is a
-deliberately generous 30s: a timeout should mean something is genuinely wrong,
-not that Loki was briefly busy. Lower it only if you would rather lose a slow
-batch than hold a push slot.
+In batch mode a timed-out batch is **retried once**. The request body was
+already sent, so Loki may have ingested the records and only the
+acknowledgement was lost. The retry is safe anyway: records are timestamped
+when they are accepted, so the retry is byte-identical, and Loki discards an
+entry whose stream, timestamp and line all match one it already holds, so a
+one-off timeout costs at most a rare duplicate line rather than the batch.
+
+A record that times out a second time is dropped and reported. Retrying
+indefinitely would turn a Loki that ingests but acknowledges slower than
+`timeoutMs` into an endless resend loop, starving newer records — so a
+persistently slow Loki is better fixed by raising `timeoutMs`.
 
 ### Delivery behavior
 
@@ -146,21 +149,23 @@ them, so a flush that arrives while an earlier push is still in flight does not
 lose anything.
 
 - **Retryable failures** — connection errors, HTTP 408, 429, and any 5xx — put
-  the batch back at the front of the buffer. These are all cases where Loki
-  demonstrably did *not* ingest the records, so a retry cannot duplicate them.
-  The retry waits for the next flush interval rather than firing immediately,
-  so a struggling Loki isn't hammered.
+  the batch back at the front of the buffer. The retry waits for the next flush
+  interval rather than firing immediately, so a struggling Loki isn't hammered.
+- **Timeouts** are retried the same way, but only once per record (see above).
 - **Permanent failures** (400, 401, 413 — anything the server will keep
   rejecting) drop the batch instead of retrying forever.
-- **Timeouts** drop the batch too, because whether it was ingested is unknowable
-  (see above).
+- **During `close()`** nothing is retried, so a dead Loki cannot keep shutdown
+  from finishing; failed batches are dropped.
 - **Buffer overflow** drops the oldest records, since the newest are the ones
   you are most likely to still need. A retried batch that no longer fits is
   reported as dropped, not as re-queued.
 
-Every discard is reported on `stderr` with a count. Overflow reports are
-aggregated to at most one line per flush interval, so a sustained outage does
-not turn into a stderr storm.
+Every failed push and buffer overflow is reported on `stderr` with a count and
+the running total dropped so far, followed by Loki's response body when it sent
+one. Overflow reports are aggregated to at most one line per flush interval, so
+a sustained outage does not turn into a stderr storm. Records logged after
+`close()` are reported only once, with no count. To alert on loss, poll
+`logger.getDroppedCount()` rather than reading stderr — it counts every path.
 
 ## API
 
@@ -206,6 +211,19 @@ logged *after* it is dropped, and reported once on `stderr`. That is deliberate:
 a service still logging while it shuts down would otherwise keep re-arming the
 drain and `close()` would never resolve — leaving the process to be SIGKILLed,
 which loses the entire buffer rather than saving it.
+
+### getDroppedCount()
+
+Total records discarded over the logger's lifetime, across every drop path:
+permanent failures, a second timeout, failures during `close()`, buffer
+overflow, and records logged after `close()`. Poll it to alert on log loss. Always `0` in direct
+mode, where each failure surfaces on the promise the log call returns.
+
+```typescript
+if (logger.getDroppedCount() > 0) {
+  metrics.gauge("loki_records_dropped", logger.getDroppedCount());
+}
+```
 
 ## Named Loggers
 

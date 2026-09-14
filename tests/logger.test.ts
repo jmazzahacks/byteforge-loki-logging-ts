@@ -8,6 +8,7 @@ const mockStop = vi.fn();
 const mockBatchFlush = vi.fn();
 const mockDrain = vi.fn().mockResolvedValue(undefined);
 const mockClose = vi.fn().mockResolvedValue(undefined);
+const mockGetDroppedCount = vi.fn().mockReturnValue(7);
 
 vi.mock("../src/batch.js", function () {
   return {
@@ -19,6 +20,7 @@ vi.mock("../src/batch.js", function () {
         flush: mockBatchFlush,
         drain: mockDrain,
         close: mockClose,
+        getDroppedCount: mockGetDroppedCount,
       };
     }),
   };
@@ -148,6 +150,25 @@ describe("LokiLogger", function () {
 
       await logger.close();
       expect(mockClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("should report the batch manager's lifetime dropped count", function () {
+      const logger = new LokiLogger({
+        transport: { url: "http://localhost:3100" },
+        batch: { capacity: 10 },
+      });
+
+      expect(logger.getDroppedCount()).toBe(7);
+    });
+  });
+
+  describe("dropped count in direct mode", function () {
+    it("should be zero, since failures surface on the returned promise", function () {
+      const logger = new LokiLogger({
+        transport: { url: "http://localhost:3100" },
+      });
+
+      expect(logger.getDroppedCount()).toBe(0);
     });
   });
 });

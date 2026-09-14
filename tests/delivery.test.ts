@@ -159,11 +159,16 @@ describe("delivery guarantees", function () {
     expect(stub.received).toContain("LATE-CRITICAL-1");
     expect(stub.received).toContain("LATE-CRITICAL-2");
 
-    // The hung batch itself is deliberately NOT retried — the server may have
-    // already ingested it — but it is reported rather than lost silently.
-    expect(stub.received).not.toContain("EARLY-1");
+    // Regression for ticket f59278b2: the hung batch used to be dropped. It is
+    // retried now — a retry carries the original timestamps, so if Loki did
+    // ingest the first attempt it discards the identical copy. The stub never
+    // records a hung request's entries, so exactly one sighting is the retry.
+    const early = stub.received.filter(function isEarly(message) {
+      return message === "EARLY-1";
+    });
+    expect(early.length).toBe(1);
     const reported = errorSpy.mock.calls.some(function isTimeoutReport(call) {
-      return String(call[0]).includes("timed out") && String(call[0]).includes("dropped 2 record(s)");
+      return String(call[0]).includes("timed out") && String(call[0]).includes("re-queued 2 record(s)");
     });
     expect(reported).toBe(true);
 

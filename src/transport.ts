@@ -12,6 +12,9 @@ import type { LokiTransportConfig, TransportResult } from "./types.js";
  * A push that exceeded `timeoutMs`. Distinct from other socket failures
  * because it is *ambiguous*: the request body was already sent, so Loki may
  * well have ingested the batch and only the acknowledgement was lost.
+ * `BatchManager` retries it once anyway, relying on Loki discarding identical
+ * entries; a direct-mode caller retrying it should keep the original
+ * timestamps for the same reason.
  */
 export class LokiTimeoutError extends Error {
   readonly timeoutMs: number;

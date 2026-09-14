@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { BatchManager } from "../src/batch.js";
+import { LokiTimeoutError } from "../src/transport.js";
 import type { LogRecord } from "../src/types.js";
 
 // Mock the emitter
@@ -381,6 +382,159 @@ describe("BatchManager", function () {
       return String(call[0]).includes("after close()");
     });
     expect(warned).toBe(true);
+    // Lost all the same, so they count.
+    expect(batch.getDroppedCount()).toBe(100);
+
+    errorSpy.mockRestore();
+  });
+
+  it("re-queues a timed-out push instead of dropping it", async function () {
+    // Regression for ticket f59278b2: a timeout dropped the batch while a 500
+    // re-queued it. Records are stamped at add(), so a retry is byte-identical
+    // and Loki discards the copy if the first attempt was ingested after all.
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+    mockEmitBatch.mockRejectedValueOnce(new LokiTimeoutError(30000));
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+
+    await vi.waitFor(function requeued() {
+      expect(batch.getBufferSize()).toBe(2);
+    });
+    expect(errorSpy.mock.calls[0][0]).toContain("timed out, re-queued 2 record(s)");
+    expect(batch.getDroppedCount()).toBe(0);
+
+    errorSpy.mockRestore();
+  });
+
+  it("retries a timed-out record only once", async function () {
+    // Review finding: a Loki that ingests but acks slower than timeoutMs would
+    // otherwise be sent the same records on every flush forever, starving
+    // newer ones until the buffer overflowed — reported as loss even though
+    // Loki held every record.
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+    mockEmitBatch
+      .mockRejectedValueOnce(new LokiTimeoutError(30000))
+      .mockRejectedValueOnce(new LokiTimeoutError(30000));
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+    await vi.waitFor(function requeued() {
+      expect(batch.getBufferSize()).toBe(2);
+    });
+
+    batch.flush();
+    await vi.waitFor(function droppedOnSecondTimeout() {
+      expect(batch.getDroppedCount()).toBe(2);
+    });
+    expect(batch.getBufferSize()).toBe(0);
+    const reported = errorSpy.mock.calls.some(function isSecondTimeout(call) {
+      return String(call[0]).includes("timed out again, dropped 2 record(s)");
+    });
+    expect(reported).toBe(true);
+
+    errorSpy.mockRestore();
+  });
+
+  it("keeps a lifetime count of records dropped by failed pushes", async function () {
+    // Per-event stderr lines cannot be alerted on; a running total can.
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+    mockEmitBatch.mockResolvedValue({
+      ok: false,
+      statusCode: 400,
+      body: "malformed stream",
+    });
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2 },
+    );
+
+    for (let i = 1; i <= 4; i++) {
+      batch.add(makeRecord(`msg${i}`));
+    }
+
+    await vi.waitFor(function bothDropped() {
+      expect(batch.getDroppedCount()).toBe(4);
+    });
+    const messages = errorSpy.mock.calls.map(function first(call) {
+      return String(call[0]);
+    });
+    expect(messages[0]).toContain("(2 dropped total)");
+    expect(messages[1]).toContain("(4 dropped total)");
+
+    errorSpy.mockRestore();
+  });
+
+  it("counts buffer-overflow drops in the lifetime total", function () {
+    mockEmitBatch.mockReturnValue(new Promise(function neverSettles() {}));
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2, maxBufferRecords: 3, maxConcurrentPushes: 1 },
+    );
+
+    for (let i = 1; i <= 7; i++) {
+      batch.add(makeRecord(`msg${i}`));
+    }
+
+    // 2 in flight, 3 buffered, 2 pushed out the front.
+    expect(batch.getDroppedCount()).toBe(2);
+
+    errorSpy.mockRestore();
+  });
+
+  it("labels Loki's response body instead of appending it raw", async function () {
+    // Reported as looking like a formatting bug: "re-queued 20 record(s)
+    // empty ring" — Loki's own 500 body, unlabeled, trailing newline included.
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(function silence() {});
+    mockEmitBatch.mockResolvedValueOnce({
+      ok: false,
+      statusCode: 500,
+      body: "empty ring\n",
+    });
+
+    batch = new BatchManager(
+      { url: "http://localhost:3100" },
+      {},
+      { capacity: 2 },
+    );
+
+    batch.add(makeRecord("msg1"));
+    batch.add(makeRecord("msg2"));
+
+    await vi.waitFor(function reported() {
+      expect(errorSpy).toHaveBeenCalled();
+    });
+    const call = errorSpy.mock.calls[0];
+    expect(call.length).toBe(1);
+    expect(String(call[0])).toContain('response: "empty ring"');
+    expect(String(call[0])).not.toContain("\n");
 
     errorSpy.mockRestore();
   });
