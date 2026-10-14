@@ -3,3 +3,4 @@ dist/
 *.tsbuildinfo
 .mcp.json
 .claude/
+.codex/
