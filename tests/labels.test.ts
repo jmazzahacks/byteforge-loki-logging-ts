@@ -40,10 +40,22 @@ describe("sanitizeLabel", function () {
 });
 
 describe("sanitizeLabels", function () {
-  it("should sanitize both keys and values", function () {
+  it("should sanitize keys and preserve values", function preserveValues() {
     const input = { "app.name": "my-service", env: "prod" };
     const result = sanitizeLabels(input);
-    expect(result).toEqual({ app_name: "my_service", env: "prod" });
+    expect(result).toEqual({ app_name: "my-service", env: "prod" });
+  });
+
+  it("should preserve punctuation, whitespace, Unicode and empty values", function preserveSpecialValues() {
+    const input = {
+      quoted: '\"my service\"',
+      path: "C:\\logs\\app.log",
+      multiline: "first\nsecond\tline",
+      unicode: "日本語 🚀",
+      punctuation: "@:/!?='",
+      empty: "",
+    };
+    expect(sanitizeLabels(input)).toEqual(input);
   });
 
   it("should drop keys that become empty after sanitization", function () {

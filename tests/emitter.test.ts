@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { LokiEmitter } from "../src/emitter.js";
+import { LokiTransport } from "../src/transport.js";
 import type { LogRecord } from "../src/types.js";
 
 // Mock the transport module so we don't make real HTTP requests
@@ -48,13 +49,13 @@ describe("LokiEmitter", function () {
     it("should include tags in labels", function () {
       emitter = new LokiEmitter(
         { url: "http://localhost:3100" },
-        { tags: { app: "myapp", env: "prod" }, replaceTimestamp: false },
+        { tags: { "app.name": "newsbash-web", env: "prod" }, replaceTimestamp: false },
       );
       const record = makeRecord();
       const payload = emitter.buildPayload([record]);
 
       expect(payload.streams[0].stream).toEqual({
-        app: "myapp",
+        app_name: "newsbash-web",
         env: "prod",
         severity: "info",
       });
@@ -68,18 +69,18 @@ describe("LokiEmitter", function () {
       const record = makeRecord({ logger: "my.module" });
       const payload = emitter.buildPayload([record]);
 
-      expect(payload.streams[0].stream["logger"]).toBe("my_module");
+      expect(payload.streams[0].stream["logger"]).toBe("my.module");
     });
 
     it("should promote props to labels", function () {
       emitter = new LokiEmitter(
         { url: "http://localhost:3100" },
-        { propsToLabels: ["request_id"], replaceTimestamp: false },
+        { propsToLabels: ["request.id"], replaceTimestamp: false },
       );
-      const record = makeRecord({ extra: { request_id: "abc123" } });
+      const record = makeRecord({ extra: { "request.id": "abc-123.example" } });
       const payload = emitter.buildPayload([record]);
 
-      expect(payload.streams[0].stream["request_id"]).toBe("abc123");
+      expect(payload.streams[0].stream["request_id"]).toBe("abc-123.example");
     });
 
     it("should format message as JSON when asJson is true", function () {
@@ -124,6 +125,25 @@ describe("LokiEmitter", function () {
       expect(payload.streams).toHaveLength(2);
     });
 
+    it("should keep formerly colliding values separate and group exact matches", function groupRawValues() {
+      emitter = new LokiEmitter(
+        { url: "http://localhost:3100" },
+        { propsToLabels: ["service"], replaceTimestamp: false },
+      );
+      const names = ["newsbash-web", "newsbash.web", "newsbash_web", "newsbash-web"];
+      const records = names.map(function makeServiceRecord(service, index) {
+        return makeRecord({ message: String(index), extra: { service } });
+      });
+      const payload = emitter.buildPayload(records);
+
+      expect(payload.streams.map(function readService(stream) {
+        return stream.stream.service;
+      })).toEqual(["newsbash-web", "newsbash.web", "newsbash_web"]);
+      expect(payload.streams.map(function readMessages(stream) {
+        return stream.values.map(function readMessage(value) { return value[1]; });
+      })).toEqual([["0", "3"], ["1"], ["2"]]);
+    });
+
     it("should use custom level and logger tag names", function () {
       emitter = new LokiEmitter(
         { url: "http://localhost:3100" },
@@ -138,6 +158,22 @@ describe("LokiEmitter", function () {
   });
 
   describe("emit", function () {
+    it("should JSON-escape label values without changing them", async function serializeRawValues() {
+      const value = '"quoted"\\path\n日本語 🚀';
+      emitter = new LokiEmitter(
+        { url: "http://localhost:3100" },
+        { tags: { application: value }, propsToLabels: ["detail"], replaceTimestamp: false },
+      );
+      await emitter.emit(makeRecord({ logger: value, extra: { detail: value } }));
+
+      const transport = vi.mocked(LokiTransport).mock.results[0].value;
+      expect(transport.send).toHaveBeenCalledTimes(1);
+      const payload = JSON.parse(transport.send.mock.calls[0][0]);
+      expect(payload.streams[0].stream).toEqual({
+        application: value, severity: "info", logger: value, detail: value,
+      });
+    });
+
     it("should return null for empty batch", async function () {
       emitter = new LokiEmitter({ url: "http://localhost:3100" });
       const result = await emitter.emitBatch([]);

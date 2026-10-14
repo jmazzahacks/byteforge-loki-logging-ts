@@ -1,7 +1,7 @@
 import { LABEL_VALID_CHARS } from "./constants.js";
 
 /**
- * Sanitize a single label key or value for Prometheus/Loki compatibility.
+ * Sanitize a label key. Do not apply this transformation to label values.
  * Strips quotes, replaces spaces/dots/dashes with underscores, removes
  * any remaining invalid characters.
  */
@@ -17,7 +17,8 @@ export function sanitizeLabel(value: string): string {
 }
 
 /**
- * Sanitize all keys and values in a labels record.
+ * Sanitize label keys while preserving values verbatim.
+ * Values are escaped by JSON serialization when the payload is sent.
  */
 export function sanitizeLabels(
   labels: Record<string, string>,
@@ -25,9 +26,8 @@ export function sanitizeLabels(
   const result: Record<string, string> = {};
   for (const key of Object.keys(labels)) {
     const sanitizedKey = sanitizeLabel(key);
-    const sanitizedValue = sanitizeLabel(labels[key]);
     if (sanitizedKey.length > 0) {
-      result[sanitizedKey] = sanitizedValue;
+      result[sanitizedKey] = labels[key];
     }
   }
   return result;

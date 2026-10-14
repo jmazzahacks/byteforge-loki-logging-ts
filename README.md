@@ -231,7 +231,7 @@ Pass a logger name as the second constructor argument. It appears as a label on 
 
 ```typescript
 const logger = new LokiLogger(config, "api.users");
-// All logs will include {logger: "api_users"} label
+// All logs will include {logger: "api.users"} label
 ```
 
 ## Self-Signed Certificates
@@ -260,11 +260,24 @@ const logger = new LokiLogger({
 
 ## Label Sanitization
 
-Labels are automatically sanitized for Prometheus/Loki compatibility:
+Label **names** are automatically sanitized for Prometheus/Loki compatibility:
 
 - Surrounding quotes are stripped
 - Spaces, dots, and dashes become underscores
 - All other non-alphanumeric/underscore characters are removed
+
+Label **values** are preserved exactly, including hyphens, dots, spaces, quotes,
+and Unicode. JSON serialization escapes them for transport. This applies to
+static tags, logger names, and fields promoted through `propsToLabels`.
+
+**Behavior change in 0.6.0:** versions through 0.5.0 also transformed values. After upgrading,
+`newsbash-web` stays `newsbash-web` and `api.users` stays `api.users`. Distinct values
+such as `newsbash-web`, `newsbash.web`, and `newsbash_web` now create separate streams.
+Previously ingested logs retain their old labels; update dashboard and alert queries
+to match the original values. During migration, a selector such as
+`{application=~"newsbash[-_]web"}` matches both old and new application values.
+Consumers that explicitly require transformed values can still call `sanitizeLabel`
+before supplying them. `sanitizeLabels` now transforms only keys.
 
 ```typescript
 import { sanitizeLabel } from "byteforge-loki-logging-ts";
